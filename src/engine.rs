@@ -1,4 +1,4 @@
-//! Orchestrates SpiceDB ReBAC + optional Cedar ABAC, plus optional replication.
+//! Orchestrates SpiceDB ReBAC and Cedar ABAC.
 
 use std::sync::Arc;
 
@@ -15,10 +15,7 @@ use crate::types::{AuthError, CedarContext, LothConfig};
 
 /// The unified authorization coordinator engine ("Loth").
 ///
-/// This engine harmonizes a structural Relationship-Based Access Control (ReBAC) layer
-/// managed via SpiceDB alongside a dynamic Attribute-Based Access Control (ABAC) layer
-/// powered by the Cedar policy language. It also supports fail-closed tracking behavior
-/// linked directly to upstream transactional data replication streams.
+/// Combines ReBAC (SpiceDB) with dynamic ABAC (Cedar) policies.
 pub struct LothEngine {
     rebac: Rebac,
     abac: AbacEngine,
@@ -26,18 +23,17 @@ pub struct LothEngine {
     fatal_replication: Option<FatalReplicationRx>,
 }
 
-/// Operational parameters defining runtime schema verification and failure safety policies.
+/// Runtime parameters for schema verification and failure safety.
 #[derive(Debug, Clone)]
 pub struct EngineSettings {
-    /// Strategy to utilize when parsing and matching schema definitions during boot hooks.
+    /// Strategy for schema validation during boot.
     pub schema_mode: SchemaMode,
-    /// Bypasses authorization requests or forces failure if replication state trackers fault out.
+    /// Whether to enforce fail-closed checks if replication trackers fault.
     pub enable_replication_fail_closed: bool,
 }
 
 impl Default for EngineSettings {
-    /// Provides default engine execution policies focusing on cautious schema verification
-    /// and strict fail-closed safety semantics.
+    /// Returns default policy: verify schemas and enable fail-closed safety.
     fn default() -> Self {
         Self {
             schema_mode: SchemaMode::VerifyOnly,
@@ -47,17 +43,11 @@ impl Default for EngineSettings {
 }
 
 impl LothEngine {
-    /// Initializes the engine, builds client attachments, and verifies or applies target schemas.
-    ///
-    /// # Arguments
-    ///
-    /// * `cfg` - Path configuration metadata pointing to schemas, access tokens, and server addresses.
-    /// * `settings` - Validation behaviors enforcing automatic database provisioning strategies.
+    /// Initializes the engine, establishes connections, and synchronizes schemas.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` if connecting to SpiceDB fails, input policy syntax contains
-    /// layout bugs, or the initial schema synchronization checks fail.
+    /// Returns `AuthError` if connection fails or schema/policy validation errors occur.
     pub async fn from_config(
         cfg: LothConfig<'_>,
         settings: EngineSettings,
@@ -69,7 +59,7 @@ impl LothEngine {
             None => DEFAULT_SCHEMA_ZED.to_owned(),
         };
 
-        // Ensure schema so definitions exist (fixes your "object definition not found" errors).
+        // Ensure schema exists in the SpiceDB cluster.
         SchemaManager::new(Arc::clone(&client))
             .ensure_schema(&zed_schema, settings.schema_mode)
             .await?;
@@ -92,23 +82,13 @@ impl LothEngine {
         Ok((engine, client))
     }
 
-    /// Attaches replication fail-closed monitoring to the engine.
-    ///
-    /// # Arguments
-    ///
-    /// * `fatal_rx` - A watch channel receiver tracking fatal errors occurring in background workers.
+    /// Attaches a watch channel to monitor replication health for fail-closed checks.
     pub fn with_replication_fail_closed(mut self, fatal_rx: FatalReplicationRx) -> Self {
         self.fatal_replication = Some(fatal_rx);
         self
     }
 
-    /// Assembles an unstarted transactional replication data pipeline.
-    ///
-    /// # Arguments
-    ///
-    /// * `client` - The reference-counted client pointing to the target cluster connection.
-    /// * `queue_capacity` - Total number of event slots allocated inside memory queues before blocking.
-    /// * `settings` - Replication throttling policies and transaction boundaries.
+    /// Creates an unstarted transactional replication pipeline.
     pub fn create_replication(
         &self,
         client: Arc<SpiceDbClient>,
@@ -118,16 +98,16 @@ impl LothEngine {
         replication_pipeline(client, queue_capacity, settings)
     }
 
-    /// Exposes a copy slice of the validated active Zed schema rules.
+    /// Returns a reference to the active Zed schema.
     pub fn zed_schema(&self) -> &str {
         &self.zed_schema
     }
 
-    /// Enforces short-circuit error paths if attached data replication tasks have crashed.
+    /// Enforces fail-closed logic if replication state is in a fatal error state.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` containing structural protocol failure payloads if replication is dead.
+    /// Returns `AuthError` if replication has faulted.
     fn fail_closed_if_replication_broken(&self) -> Result<(), AuthError> {
         let Some(rx) = &self.fatal_replication else {
             return Ok(());
@@ -143,18 +123,11 @@ impl LothEngine {
         Ok(())
     }
 
-    /// Primary permission gateway entrypoint bypassing supplemental Cedar engine attributes.
-    ///
-    /// # Arguments
-    ///
-    /// * `user_id` - Unique identity tag pointing to the challenging user subject.
-    /// * `action` - The specific operation permission flag name to validate.
-    /// * `resource_type` - Categorization namespace of the targeted object type.
-    /// * `resource_id` - The identifier matching the specific object instance.
+    /// Checks permission using ReBAC only.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` if replication streams fail-closed, or connection timeouts occur.
+    /// Returns `AuthError` on connection failures or if replication is broken.
     pub async fn check_permission(
         &self,
         user_id: &str,
@@ -172,19 +145,11 @@ impl LothEngine {
         .await
     }
 
-    /// Primary permission gateway. Combines relational validation with contextual attribute evaluation.
-    ///
-    /// # Arguments
-    ///
-    /// * `user_id` - Unique identity tag pointing to the challenging user subject.
-    /// * `action` - The specific operation permission flag name to validate.
-    /// * `resource_type` - Categorization namespace of the targeted object type.
-    /// * `resource_id` - The identifier matching the specific object instance.
-    /// * `context` - An optional container carrying extra property attributes evaluated by Cedar.
+    /// Checks permission combining ReBAC and contextual Cedar ABAC.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` if the backend connection breaks or evaluation context conversions fail.
+    /// Returns `AuthError` on connection, evaluation, or replication failures.
     pub async fn check_permission_with_context<'a, C>(
         &self,
         user_id: &str,
@@ -218,19 +183,7 @@ impl LothEngine {
         )
     }
 
-    /// Provisions or touches a relationship edge tuple linking a resource to a subject.
-    ///
-    /// # Arguments
-    ///
-    /// * `resource_type` - Resource namespace target.
-    /// * `resource_id` - Unique identity mapping the target resource item.
-    /// * `relation` - The connection relation edge name.
-    /// * `subject_type` - Identity namespace matching the target subject type.
-    /// * `subject_id` - Core identifier key string pointing to the identity subject.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if replication blocks updates or SpiceDB transactional faults occur.
+    /// Registers a new relationship tuple.
     pub async fn register_relation(
         &self,
         resource_type: &str,
@@ -253,19 +206,7 @@ impl LothEngine {
             .await
     }
 
-    /// Revokes an exact relationship tuple binding configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `resource_type` - Resource namespace target.
-    /// * `resource_id` - Unique identity mapping the target resource item.
-    /// * `relation` - The connection relation edge name to sever.
-    /// * `subject_type` - Identity namespace matching the target subject type.
-    /// * `subject_id` - Core identifier key string pointing to the identity subject.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if network paths disconnect or verification filters reject arguments.
+    /// Revokes an existing relationship tuple.
     pub async fn revoke_relation(
         &self,
         resource_type: &str,
@@ -288,23 +229,9 @@ impl LothEngine {
             .await
     }
 
-    /// Performs a bulk prune deletion of relationship edges filtering on flexible subject definitions.
+    /// Prunes relationships based on optional subject filters.
     ///
-    /// # Arguments
-    ///
-    /// * `resource_type` - Resource type identifier constraints.
-    /// * `resource_id` - Exact resource ID lookup key boundary.
-    /// * `relation` - Target edge descriptor to clean up.
-    /// * `subject_type` - Optional type namespace constraint to filter deletions.
-    /// * `subject_id` - Optional exact user ID pattern to target for deletion.
-    ///
-    /// # Returns
-    ///
-    /// Count of deleted tuples evicted from the graph.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if the underlying query engine drops requests.
+    /// Returns the number of deleted tuples.
     pub async fn revoke_by_filter(
         &self,
         resource_type: &str,
@@ -326,17 +253,7 @@ impl LothEngine {
             .await
     }
 
-    /// Retrieves all object instances of a given type that a user can access.
-    ///
-    /// # Arguments
-    ///
-    /// * `user_id` - Target checking subject identifier string.
-    /// * `action` - Target resource permission string.
-    /// * `resource_type` - Structural resource category layout type.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if gRPC streams crash during transit.
+    /// Retrieves all resources of a given type accessible to a user.
     pub async fn lookup_resources(
         &self,
         user_id: &str,
@@ -349,15 +266,7 @@ impl LothEngine {
             .await
     }
 
-    /// Live updates Cedar ABAC engine evaluation rule profiles in memory across threads.
-    ///
-    /// # Arguments
-    ///
-    /// * `new_policies_dsl` - Optional replacement policy block string. Passing `None` turns off ABAC verification.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if syntax compiling rules fail validation checks.
+    /// Updates Cedar policies in memory.
     pub fn update_cedar_policies(&self, new_policies_dsl: Option<&str>) -> Result<(), AuthError> {
         self.abac.update_policies(new_policies_dsl)
     }
