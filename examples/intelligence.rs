@@ -1,12 +1,10 @@
-//! Example: "intel gateway" authorization + replication.
+//! Intelligence gateway with authorization and replication example.
 
-use std::borrow::Cow;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{Level, info};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
 
 use loth::cedar_context_map;
 use loth::engine::{EngineSettings, LothEngine};
@@ -14,15 +12,17 @@ use loth::replication::{RelationshipTuple, ReplicationSettings};
 use loth::spicedb::schema::SchemaMode;
 use loth::types::{AuthError, CedarContext, CedarContextBuilder, LothConfig, TextSource};
 
+/// Context attributes evaluated at the edge by the Cedar policy engine.
 #[derive(Debug)]
 struct IntelAuthzContext<'a> {
-    clearance: &'a str, // "confidential" | "secret" | "top_secret"
-    country: &'a str,   // "US", "FR", ...
+    clearance: &'a str,
+    country: &'a str,
     is_onsite: bool,
     is_working_hours: bool,
 }
 
 impl<'a> CedarContext<'a> for IntelAuthzContext<'a> {
+    /// Maps our application context structures directly into the Cedar dynamic evaluator.
     fn write_to(&self, out: &mut CedarContextBuilder<'a>) -> Result<(), AuthError> {
         cedar_context_map!(out, self, {
             "clearance" => str self.clearance,
@@ -34,22 +34,19 @@ impl<'a> CedarContext<'a> for IntelAuthzContext<'a> {
     }
 }
 
+/// The main orchestrator setting up our verified ReBAC + ABAC engine environment.
 #[tokio::main]
 async fn main() -> Result<(), AuthError> {
-    init_tracing();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
 
-    let endpoint = env::var("SPICEDB_ENDPOINT").expect("SPICEDB_ENDPOINT is required");
-    let token = env::var("SPICEDB_TOKEN").expect("SPICEDB_TOKEN is required");
+    let endpoint = env::var("SPICEDB_ENDPOINT").expect("SPICEDB_ENDPOINT environment variable is required");
+    let token = env::var("SPICEDB_TOKEN").expect("SPICEDB_TOKEN environment variable is required");
 
-    let cedar_policy = Some(TextSource::from_path("examples/policies/intel.cedar"));
-
-    let cfg = {
-        let mut c = LothConfig::new(Cow::from(endpoint.clone()), Cow::from(token.clone()));
-        if let Some(p) = cedar_policy {
-            c = c.with_cedar_policies(p);
-        }
-        c
-    };
+    // Initialize configuration cleanly using modern idiom patterns
+    let cfg = LothConfig::new(endpoint, token)
+        .with_cedar_policies(TextSource::from_path("examples/policies/intel.cedar"));
 
     let settings = EngineSettings {
         schema_mode: SchemaMode::ApplyIfDifferent,
@@ -57,6 +54,7 @@ async fn main() -> Result<(), AuthError> {
     };
 
     let (engine, client) = LothEngine::from_config(cfg, settings).await?;
+    
     let (handle, worker) = engine.create_replication(
         Arc::clone(&client),
         4096,
@@ -70,106 +68,56 @@ async fn main() -> Result<(), AuthError> {
 
     let engine = engine.with_replication_fail_closed(handle.fatal_rx());
 
+    // Spawn the background worker task to process queued updates
     tokio::spawn(async move {
         if let Err(e) = worker.run().await {
-            eprintln!("replication worker stopped: {e}");
+            eprintln!("Replication worker encountered a critical error: {e}");
         }
     });
 
     let q = handle.queue();
 
-    q.upsert_tuple(RelationshipTuple::new(
-        "tenant", "t1", "member", "user", "alice",
-    ))
-    .await?;
-    q.upsert_tuple(RelationshipTuple::new(
-        "entity_state",
-        "file-742",
-        "parent",
-        "tenant",
-        "t1",
-    ))
-    .await?;
-    q.upsert_tuple(RelationshipTuple::new(
-        "entity_state",
-        "file-742",
-        "reader",
-        "user",
-        "alice",
-    ))
-    .await?;
+    // Batch register structural relationship graphs
+    q.upsert_tuple(RelationshipTuple::new("tenant", "t1", "member", "user", "alice")).await?;
+    q.upsert_tuple(RelationshipTuple::new("entity_state", "file-742", "parent", "tenant", "t1")).await?;
+    q.upsert_tuple(RelationshipTuple::new("entity_state", "file-742", "reader", "user", "alice")).await?;
 
-    // Note: 'bob' is never given any relationship tuples targeting file-742.
-
+    // Allow the replication batch task loop to flush to SpiceDB
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let valid_ctx = IntelAuthzContext {
         clearance: "secret",
         country: "US",
         is_onsite: true,
-        is_working_hours: true, // she worked at 9:00am.
+        is_working_hours: true,
     };
 
+    // Case 1: Alice has correct structural ReBAC relationships and satisfies context ABAC rules
     let allowed_success = engine
-        .check_permission_with_context(
-            "alice",
-            "read",
-            "entity_state",
-            "file-742",
-            Some(&valid_ctx),
-        )
+        .check_permission_with_context("alice", "read", "entity_state", "file-742", Some(&valid_ctx))
         .await?;
 
-    info!(
-        user = "alice",
-        allowed = allowed_success,
-        reason = "Valid ReBAC permissions and fully satisfying ABAC Cedar context",
-        "CASE 1"
-    );
+    info!(user = "alice", allowed = allowed_success, "CASE 1: Valid ReBAC and ABAC context");
 
     let invalid_ctx = IntelAuthzContext {
-        clearance: "secret",
-        country: "US",
-        is_onsite: true,
-        is_working_hours: false, // trigger Cedar policy failure.
+        is_working_hours: false, // Fails Cedar criteria check
+        ..valid_ctx
     };
 
+    // Case 2: Alice has valid ReBAC structural rights, but is rejected by environmental edge filters
     let allowed_context_fail = engine
-        .check_permission_with_context(
-            "alice",
-            "read",
-            "entity_state",
-            "file-742",
-            Some(&invalid_ctx),
-        )
+        .check_permission_with_context("alice", "read", "entity_state", "file-742", Some(&invalid_ctx))
         .await?;
 
-    info!(
-        user = "alice",
-        allowed = allowed_context_fail,
-        reason = "Has SpiceDB relationship permissions, but fails ABAC context criteria (is_working_hours = false)",
-        "CASE 2"
-    );
+    info!(user = "alice", allowed = allowed_context_fail, "CASE 2: ReBAC matches, but ABAC filters deny access");
 
-    // Bob has valid context variables, but no graph connection.
+    // Case 3: Bob presents valid environment context tokens, but does not exist on the structural tree path
     let allowed_rebac_fail = engine
         .check_permission_with_context("bob", "read", "entity_state", "file-742", Some(&valid_ctx))
         .await?;
 
-    info!(
-        user = "bob",
-        allowed = allowed_rebac_fail,
-        reason = "Fails because user 'bob' has no reader or membership relation linked to this entity in SpiceDB",
-        "CASE 3"
-    );
+    info!(user = "bob", allowed = allowed_rebac_fail, "CASE 3: ABAC matches, but ReBAC relationship graph denies access");
 
     handle.shutdown();
     Ok(())
-}
-
-fn init_tracing() {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
-        .finish();
-    let _ = tracing::subscriber::set_global_default(subscriber);
 }
