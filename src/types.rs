@@ -119,21 +119,15 @@ pub enum AuthError {
 
     /// Cedar policy compilation or syntax error.
     #[error("Cedar validation/parsing error: {message}")]
-    CedarValidation {
-        message: String,
-    },
+    CedarValidation { message: String },
 
     /// Runtime error during Cedar policy evaluation.
     #[error("Cedar evaluation error: {message}")]
-    CedarEvaluation {
-        message: String,
-    },
+    CedarEvaluation { message: String },
 
     /// User input formatting or validation failure.
     #[error("Invalid input: {message}")]
-    ValidationError {
-        message: String,
-    },
+    ValidationError { message: String },
 
     /// Filesystem I/O interaction failure.
     #[error("I/O error while {operation} ({path}): {source}")]

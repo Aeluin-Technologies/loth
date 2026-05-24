@@ -291,13 +291,16 @@ fn build_updates(
         out.push(RelationshipUpdate {
             operation: match op {
                 RelationshipOp::Create => {
-                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Create as i32
+                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Create
+                        as i32
                 }
                 RelationshipOp::Touch => {
-                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Touch as i32
+                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Touch
+                        as i32
                 }
                 RelationshipOp::Delete => {
-                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Delete as i32
+                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Delete
+                        as i32
                 }
             },
             relationship: Some(relationship),

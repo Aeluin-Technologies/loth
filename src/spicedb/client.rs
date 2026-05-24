@@ -48,7 +48,7 @@ impl SpiceDbClient {
     ///
     /// # Errors
     ///
-    /// Returns `AuthError` if the endpoint is invalid, the token is malformed, 
+    /// Returns `AuthError` if the endpoint is invalid, the token is malformed,
     /// or the initial connection handshake fails.
     pub async fn connect(endpoint: &str, token: &str) -> Result<Arc<Self>, AuthError> {
         let ep = Endpoint::from_shared(endpoint.to_owned()).map_err(AuthError::validation)?;
