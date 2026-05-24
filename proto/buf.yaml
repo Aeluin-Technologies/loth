@@ -1,0 +1,5 @@
+version: v1
+deps:
+  - buf.build/authzed/api
+  - buf.build/bufbuild/protovalidate
+  - buf.build/googleapis/googleapis

@@ -1,0 +1,29 @@
+definition user {}
+
+definition role {
+  relation member: user
+  relation grants_project_access: project
+  permission applies_to_project = grants_project_access
+}
+
+definition project {
+  relation member: user
+  relation role: role
+  permission can_read = member + role->applies_to_project
+  permission can_export = role->applies_to_project
+  permission can_delete = role->applies_to_project
+}
+
+definition entity {
+  relation parent_project: project
+  permission read = parent_project->can_read
+  permission export = parent_project->can_export
+  permission delete = parent_project->can_delete
+}
+
+definition event {
+  relation parent_project: project
+  permission read = parent_project->can_read
+  permission export = parent_project->can_export
+  permission delete = parent_project->can_delete
+}
