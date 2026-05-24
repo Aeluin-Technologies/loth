@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod rebac;
+pub mod schema;
 pub mod pb {
     pub mod google {
         pub mod protobuf {

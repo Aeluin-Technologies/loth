@@ -1,29 +1,112 @@
+// Galadril Gateway authorization schema.
+
 definition user {}
 
-definition role {
+// Multi-tenant root object. All business objects point here via `parent`.
+definition tenant {
+  relation administrator: user
+  relation group: group
   relation member: user
-  relation grants_project_access: project
-  permission applies_to_project = grants_project_access
+
+  // Canonical permissions on the tenant object itself.
+  permission read = member + administrator + group->read
+  permission write = administrator + group->write
+  permission delete = administrator + group->delete
+  permission share = administrator + group->share
+  permission admin = administrator + group->admin
 }
 
+// Structural group.
+definition group {
+  relation parent: tenant
+  relation member: user
+
+  // Group-scoped grants.
+  relation grants_project: project
+  relation grants_table: table
+  relation grants_entity_state: entity_state
+
+  // Canonical permissions on the group object (mostly for introspection).
+  permission read = parent->read
+  permission write = parent->admin
+  permission delete = parent->admin
+  permission share = parent->admin
+  permission admin = parent->admin
+
+  // Grants that propagate to resources.
+  permission read_project = member & grants_project->read
+  permission write_project = member & grants_project->write
+  permission delete_project = member & grants_project->delete
+  permission share_project = member & grants_project->share
+  permission admin_project = member & grants_project->admin
+
+  permission read_table = member & grants_table->read
+  permission write_table = member & grants_table->write
+  permission delete_table = member & grants_table->delete
+  permission share_table = member & grants_table->share
+  permission admin_table = member & grants_table->admin
+
+  permission read_entity_state = member & grants_entity_state->read
+  permission write_entity_state = member & grants_entity_state->write
+  permission delete_entity_state = member & grants_entity_state->delete
+  permission share_entity_state = member & grants_entity_state->share
+  permission admin_entity_state = member & grants_entity_state->admin
+}
+
+// Project is the primary business-scoped container under a tenant.
 definition project {
+  relation parent: tenant
+
+  // Direct project membership / ownership.
   relation member: user
-  relation role: role
-  permission can_read = member + role->applies_to_project
-  permission can_export = role->applies_to_project
-  permission can_delete = role->applies_to_project
+  relation administrator: user
+
+  // Groups that grant access to this project.
+  relation group: group
+
+  // Canonical permissions.
+  permission read = parent->read + member + administrator + group->member
+  permission write = parent->admin + administrator + (group->member & group->admin_project)
+  permission delete = parent->admin + administrator + (group->member & group->delete_project)
+  permission share = parent->admin + administrator + (group->member & group->share_project)
+  permission admin = parent->admin + administrator + (group->member & group->admin_project)
 }
 
-definition entity {
-  relation parent_project: project
-  permission read = parent_project->can_read
-  permission export = parent_project->can_export
-  permission delete = parent_project->can_delete
+// Tables represent Gateway-allowlisted datasets.
+definition table {
+  relation parent: tenant
+
+  relation reader: user
+  relation writer: user
+  relation administrator: user
+
+  // Group-based access (preferred).
+  relation group: group
+
+  // Canonical permissions.
+  permission read = parent->read + reader + administrator + (group->member & group->read_table)
+  permission write = parent->admin + writer + administrator + (group->member & group->write_table)
+  permission delete = parent->admin + administrator + (group->member & group->delete_table)
+  permission share = parent->admin + administrator + (group->member & group->share_table)
+  permission admin = parent->admin + administrator + (group->member & group->admin_table)
 }
 
-definition event {
-  relation parent_project: project
-  permission read = parent_project->can_read
-  permission export = parent_project->can_export
-  permission delete = parent_project->can_delete
+// Entity states are tenant-scoped objects discovered/queried by Gateway.
+definition entity_state {
+  relation parent: tenant
+
+  // Optional direct grants.
+  relation reader: user
+  relation writer: user
+  relation administrator: user
+
+  // Group-based access.
+  relation group: group
+
+  // Canonical permissions.
+  permission read = parent->read + reader + administrator + (group->member & group->read_entity_state)
+  permission write = parent->admin + writer + administrator + (group->member & group->write_entity_state)
+  permission delete = parent->admin + administrator + (group->member & group->delete_entity_state)
+  permission share = parent->admin + administrator + (group->member & group->share_entity_state)
+  permission admin = parent->admin + administrator + (group->member & group->admin_entity_state)
 }
