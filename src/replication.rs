@@ -1,12 +1,4 @@
-//! Dual-writing / replication support.
-//!
-//! Strict QoS mode:
-//! - bounded queue + `.send().await` backpressure
-//! - retry on transient failures
-//! - fail-close if replication cannot be applied
-//!
-//! This module does NOT guarantee durability across process restarts.
-//! For strict "Postgres == SpiceDB" correctness, pair this with a Postgres outbox.
+//! Dual-writing support for SpiceDB.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,26 +11,25 @@ use crate::spicedb::pb::authzed::api::v1::{Relationship, RelationshipUpdate};
 use crate::spicedb::rebac::{Rebac, RelationshipOp};
 use crate::types::AuthError;
 
-/// An immutable representation of a SpiceDB relationship tuple graph edge.
+/// Immutable representation of a SpiceDB relationship.
 ///
-/// Uses reference-counted atomic string slices (`Arc<str>`) to minimize memory allocations
-/// and facilitate cheap serialization across concurrent thread boundaries.
+/// Uses `Arc<str>` to reduce allocations and enable cheap sharing across thread boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationshipTuple {
-    /// The object namespace type of the target resource.
+    /// Object namespace type.
     pub resource_type: Arc<str>,
-    /// The unique identifier of the target resource instance.
+    /// Unique ID of the resource instance.
     pub resource_id: Arc<str>,
-    /// The name of the relation or permission connecting the resource and subject.
+    /// Relation or permission string.
     pub relation: Arc<str>,
-    /// The object namespace type of the target subject.
+    /// Subject namespace type.
     pub subject_type: Arc<str>,
-    /// The unique identifier of the target subject instance.
+    /// Unique ID of the subject instance.
     pub subject_id: Arc<str>,
 }
 
 impl RelationshipTuple {
-    /// Creates a new `RelationshipTuple` from types convertible into an `Arc<str>`.
+    /// Creates a new `RelationshipTuple` from types convertible to `Arc<str>`.
     pub fn new(
         resource_type: impl Into<Arc<str>>,
         resource_id: impl Into<Arc<str>>,
@@ -56,30 +47,30 @@ impl RelationshipTuple {
     }
 }
 
-/// Mutating operations emitted down the replication pipeline to align remote clusters.
+/// Replication mutations for the background pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicationEvent {
-    /// Atomically updates or inserts the specified tuple edge.
+    /// Inserts or updates a tuple.
     Upsert(RelationshipTuple),
-    /// Removes the designated tuple edge configuration.
+    /// Deletes a tuple.
     Delete(RelationshipTuple),
 }
 
-/// Dynamic batching and backoff threshold limits driving the background replication worker.
+/// Configuration thresholds for the replication worker.
 #[derive(Debug, Clone)]
 pub struct ReplicationSettings {
-    /// The maximum number of elements accumulated before a batch flush is forced.
+    /// Max events to buffer before a forced flush.
     pub max_batch: usize,
-    /// The maximum duration to wait before flushing an incomplete event buffer.
+    /// Max wait time before flushing an incomplete batch.
     pub flush_interval: Duration,
-    /// The absolute count of retries permitted for a failing batch before triggering a fail-closed crash.
+    /// Max retries per batch before triggering fail-close.
     pub max_retries: usize,
-    /// The base duration utilized as the initial stepping milestone for exponential backoff calculations.
+    /// Base duration for exponential backoff.
     pub base_backoff: Duration,
 }
 
 impl Default for ReplicationSettings {
-    /// Provides cautious performance thresholds designed to balance latency overhead against heavy load pressures.
+    /// Returns default conservative performance thresholds.
     fn default() -> Self {
         Self {
             max_batch: 256,
@@ -90,24 +81,18 @@ impl Default for ReplicationSettings {
     }
 }
 
-/// A handle for dispatching authorization adjustments into the async replication pipeline.
+/// Handle for dispatching events to the replication pipeline.
 #[derive(Clone)]
 pub struct ReplicationQueue {
     tx: mpsc::Sender<ReplicationEvent>,
 }
 
 impl ReplicationQueue {
-    /// Submits a replication event payload to the queue.
-    ///
-    /// This method enforces strict backpressure by waiting if the bounded queue is full.
-    ///
-    /// # Arguments
-    ///
-    /// * `ev` - The target `ReplicationEvent` payload to enqueue.
+    /// Submits a replication event, applying backpressure if the queue is full.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` if the underlying replication processing channel has terminated.
+    /// Returns `AuthError` if the receiver has been dropped.
     pub async fn enqueue(&self, ev: ReplicationEvent) -> Result<(), AuthError> {
         self.tx
             .send(ev)
@@ -115,32 +100,23 @@ impl ReplicationQueue {
             .map_err(|_| AuthError::validation("replication queue closed"))
     }
 
-    /// Helper to enqueue an upsert mutation event.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if the replication receiver loop is dead.
+    /// Enqueues an Upsert operation.
     pub async fn upsert_tuple(&self, t: RelationshipTuple) -> Result<(), AuthError> {
         self.enqueue(ReplicationEvent::Upsert(t)).await
     }
 
-    /// Helper to enqueue a delete mutation event.
-    ///
-    /// # Errors
-    ///
-    /// Returns an `AuthError` if the replication receiver loop is dead.
+    /// Enqueues a Delete operation.
     pub async fn delete_tuple(&self, t: RelationshipTuple) -> Result<(), AuthError> {
         self.enqueue(ReplicationEvent::Delete(t)).await
     }
 }
 
-/// A watch channel receiver tracking fatal pipeline faults used to enforce fail-closed checks.
+/// Watch channel tracking fatal replication errors.
 ///
-/// Contains `None` under healthy operating environments and transitions to `Some(AuthError)`
-/// if a batch fails permanently.
+/// Contains `None` if healthy, or `Some(AuthError)` if the pipeline failed permanently.
 pub type FatalReplicationRx = watch::Receiver<Option<AuthError>>;
 
-/// A control handle allowing application orchestration layers to access queues or request shutdowns.
+/// Orchestration handle for replication worker control.
 pub struct ReplicationHandle {
     queue: ReplicationQueue,
     fatal_rx: FatalReplicationRx,
@@ -148,23 +124,23 @@ pub struct ReplicationHandle {
 }
 
 impl ReplicationHandle {
-    /// Returns a cloned instance of the underlying thread-safe `ReplicationQueue`.
+    /// Returns a clone of the `ReplicationQueue`.
     pub fn queue(&self) -> ReplicationQueue {
         self.queue.clone()
     }
 
-    /// Returns a cloned instance of the active fail-closed watch receiver.
+    /// Returns the fail-closed error state.
     pub fn fatal_rx(&self) -> FatalReplicationRx {
         self.fatal_rx.clone()
     }
 
-    /// Issues an explicit termination interrupt signal across to the linked background worker thread.
+    /// Signals the background worker to shut down.
     pub fn shutdown(self) {
         let _ = self.shutdown_tx.send(());
     }
 }
 
-/// A background worker loop responsible for gathering, batching, and flushing replication events.
+/// Background worker responsible for batching and flushing events.
 pub struct ReplicationWorker {
     rebac: Rebac,
     rx: mpsc::Receiver<ReplicationEvent>,
@@ -173,13 +149,7 @@ pub struct ReplicationWorker {
     fatal_tx: watch::Sender<Option<AuthError>>,
 }
 
-/// Assembles a complete, decoupled replication channel pipeline infrastructure block.
-///
-/// # Arguments
-///
-/// * `client` - The explicit reference-counted gRPC client wrapper targeting the remote SpiceDB instance.
-/// * `queue_capacity` - The total item threshold limit allocated to the bounded channel buffer before backpressure is hit.
-/// * `settings` - Execution constraints determining maximum retry attempts and interval flushes.
+/// Initializes a replication pipeline, returning a handle and worker.
 pub fn replication_pipeline(
     client: Arc<crate::spicedb::client::SpiceDbClient>,
     queue_capacity: usize,
@@ -210,15 +180,11 @@ pub fn replication_pipeline(
 }
 
 impl ReplicationWorker {
-    /// Spawns the main asynchronous processing worker task loop.
-    ///
-    /// Periodically drains collected events or pushes full collections when the internal
-    /// layout hits configured capacity barriers.
+    /// Starts the asynchronous worker loop.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` validation message if any flush batch hits terminal connection
-    /// boundaries and exhausts all configured retry loops.
+    /// Returns `AuthError` if batch processing exhausts retry limits.
     #[instrument(level = "debug", skip(self))]
     pub async fn run(mut self) -> Result<(), AuthError> {
         let mut buf: Vec<ReplicationEvent> = Vec::with_capacity(self.settings.max_batch);
@@ -257,14 +223,7 @@ impl ReplicationWorker {
         }
     }
 
-    /// Dispatches accumulated buffer payloads via a single batched transactional gRPC request.
-    ///
-    /// Utilizes exponential backoff algorithms if transient cluster errors manifest. If it exhausts
-    /// all configured retries, it triggers a permanent fail-closed broadcast.
-    ///
-    /// # Errors
-    ///
-    /// Returns a fatal validation error if it fails to write to SpiceDB.
+    /// Dispatches batched updates via gRPC, implementing exponential backoff.
     async fn flush(&mut self, buf: &mut Vec<ReplicationEvent>) -> Result<(), AuthError> {
         if buf.is_empty() {
             return Ok(());
@@ -272,7 +231,6 @@ impl ReplicationWorker {
 
         let updates = build_updates(buf.drain(..))?;
 
-        // Retry loop: fail-close on exhaustion.
         let mut attempt = 0usize;
         loop {
             match self.rebac.write_relationships_batch(updates.clone()).await {
@@ -301,11 +259,7 @@ impl ReplicationWorker {
     }
 }
 
-/// Converts an iterator of internal replication events into a formatted list of Protobuf updates.
-///
-/// # Errors
-///
-/// Returns an `AuthError` if any structural data conversions violate backend boundaries.
+/// Converts replication events into Protobuf-compatible updates.
 fn build_updates(
     drained: impl IntoIterator<Item = ReplicationEvent>,
 ) -> Result<Vec<RelationshipUpdate>, AuthError> {
@@ -337,16 +291,13 @@ fn build_updates(
         out.push(RelationshipUpdate {
             operation: match op {
                 RelationshipOp::Create => {
-                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Create
-                        as i32
+                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Create as i32
                 }
                 RelationshipOp::Touch => {
-                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Touch
-                        as i32
+                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Touch as i32
                 }
                 RelationshipOp::Delete => {
-                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Delete
-                        as i32
+                    crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Delete as i32
                 }
             },
             relationship: Some(relationship),
@@ -356,7 +307,7 @@ fn build_updates(
     Ok(out)
 }
 
-/// Suspends the current execution thread until the given target instant milestone is breached.
+/// Suspends execution until the specified instant.
 async fn sleep_until(t: Instant) {
     let now = Instant::now();
     if t > now {
