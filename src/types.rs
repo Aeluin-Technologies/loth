@@ -8,35 +8,32 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use thiserror::Error;
 
-/// Runtime evaluation context that many applications may want.
-///
-/// This remains as a convenience type; the ABAC layer is generic and can accept app-defined contexts.
+/// Runtime evaluation context containing environment metadata.
 #[derive(Debug, Clone)]
 pub struct EvaluationContext {
-    /// The remote client or originating caller identity IP address.
+    /// Remote client IP address.
     pub ip_address: IpAddr,
-    /// The exact timestamp milestone of the authorization challenge evaluation.
+    /// Timestamp of the authorization evaluation.
     pub timestamp: DateTime<Utc>,
-    /// Flags indicating whether the originating client endpoint satisfies MDM compliance checks.
+    /// Whether the originating device passes MDM compliance.
     pub device_compliant: bool,
 }
 
-/// A policy or schema data text provider source variant.
+/// Provider source for policy or schema definitions.
 #[derive(Debug, Clone)]
 pub enum TextSource<'a> {
-    /// In-memory literal string configuration values.
+    /// In-memory string literal.
     Inline(Cow<'a, str>),
-    /// A target file path pointing to a system file resource containing definitions.
+    /// Path to a file on the filesystem.
     Path(PathBuf),
 }
 
 impl<'a> TextSource<'a> {
-    /// Loads the underlying source configuration into an owned string.
+    /// Loads the source content into an owned String.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` containing the underlying standard system I/O error
-    /// if the target storage system path cannot be accessed or successfully parsed.
+    /// Returns `AuthError::Io` if file reading fails.
     pub fn load_to_string(&self) -> Result<String, AuthError> {
         match self {
             TextSource::Inline(s) => Ok(s.to_string()),
@@ -46,35 +43,32 @@ impl<'a> TextSource<'a> {
         }
     }
 
-    /// Factory method to assemble a new filesystem storage reference link.
+    /// Creates a source from a file system path.
     pub fn from_path(path: impl AsRef<Path>) -> Self {
         Self::Path(path.as_ref().to_path_buf())
     }
 
-    /// Factory method to capture an explicit or borrowed inline literal configuration.
+    /// Creates a source from an inline string or reference.
     pub fn from_inline(s: impl Into<Cow<'a, str>>) -> Self {
         Self::Inline(s.into())
     }
 }
 
-/// Configuration payload used to initialize and bootstrap authorization engine instances.
-///
-/// - If `zed_schema` is `None`, the built-in default schema is used.
-/// - If `cedar_policies` is `None`, ABAC is disabled and Cedar context is ignored.
+/// Configuration payload used to initialize the authorization engine.
 #[derive(Debug, Clone)]
 pub struct LothConfig<'a> {
-    /// Network connection endpoint string pointing to the core SpiceDB cluster.
+    /// Remote SpiceDB cluster endpoint.
     pub spicedb_endpoint: Cow<'a, str>,
-    /// Secure preshared authorization API bearer token credential.
+    /// Secure bearer token for SpiceDB authentication.
     pub spicedb_token: Cow<'a, str>,
-    /// Optional field housing the structural schema rules to ensure on connection.
+    /// Optional schema definitions; uses defaults if None.
     pub zed_schema: Option<TextSource<'a>>,
-    /// Optional field housing the dynamic Cedar policies to evaluate.
+    /// Optional Cedar policies; disables ABAC if None.
     pub cedar_policies: Option<TextSource<'a>>,
 }
 
 impl<'a> LothConfig<'a> {
-    /// Instantiates a new base `LothConfig` requiring target cluster connection attributes.
+    /// Initializes a new configuration with required connection credentials.
     pub fn new(endpoint: impl Into<Cow<'a, str>>, token: impl Into<Cow<'a, str>>) -> Self {
         Self {
             spicedb_endpoint: endpoint.into(),
@@ -84,114 +78,101 @@ impl<'a> LothConfig<'a> {
         }
     }
 
-    /// Sets the target schema definition block.
+    /// Configures the structural schema rules for the engine.
     pub fn with_zed_schema(mut self, src: TextSource<'a>) -> Self {
         self.zed_schema = Some(src);
         self
     }
 
-    /// Sets the target Cedar policy set definitions block.
+    /// Configures the dynamic Cedar policy set for evaluation.
     pub fn with_cedar_policies(mut self, src: TextSource<'a>) -> Self {
         self.cedar_policies = Some(src);
         self
     }
 }
 
-/// Comprehensive, structured tracking errors complete with semantic operation tracing and source chaining.
+/// Comprehensive errors representing system, protocol, and evaluation failures.
 #[derive(Debug, Error)]
 pub enum AuthError {
-    /// The physical connection transport layer or connection pool faulted during execution.
+    /// Physical transport layer connection failure.
     #[error("SpiceDB transport error while {operation} (endpoint={endpoint})")]
     SpiceDbTransport {
-        /// Label describing the physical engine action running during the crash.
         operation: &'static str,
-        /// Remote address endpoint path target.
         endpoint: String,
-        /// The raw underlying network stack transport source problem wrapper.
         #[source]
         source: tonic::transport::Error,
     },
 
-    /// The remote SpiceDB cluster returned an explicit unhandled gRPC failure status flag.
+    /// gRPC failure returned by the SpiceDB server.
     #[error("SpiceDB gRPC status while {operation}: {status}")]
     SpiceDbStatus {
-        /// Label describing the core functional method block active during the fault.
         operation: &'static str,
-        /// The raw Tonic gRPC engine response metadata payload status structure.
         status: tonic::Status,
     },
 
-    /// A functional invariant or schema model definition boundary was broken during runtime execution.
+    /// Protocol violation or schema invariant failure.
     #[error("SpiceDB protocol/validation error while {operation}: {message}")]
     SpiceDbProtocol {
-        /// Label capturing the exact location triggering the validation fallback path.
         operation: &'static str,
-        /// Detail context capturing exact schema layout bugs or semantic protocol conflicts.
         message: String,
     },
 
-    /// Cedar compilation and schema parsing validation checks failed to compile.
+    /// Cedar policy compilation or syntax error.
     #[error("Cedar validation/parsing error: {message}")]
     CedarValidation {
-        /// The raw compiled description error message generated by the Cedar policy engine.
         message: String,
     },
 
-    /// The Cedar authorizer engine dropped processing routines due to runtime data schema exceptions.
+    /// Runtime error during Cedar policy evaluation.
     #[error("Cedar evaluation error: {message}")]
     CedarEvaluation {
-        /// Description of the runtime context or parameter matching data problem.
         message: String,
     },
 
-    /// User input parameters failed simple format verification patterns.
+    /// User input formatting or validation failure.
     #[error("Invalid input: {message}")]
     ValidationError {
-        /// Detailed description outlining formatting parameter conflicts.
         message: String,
     },
 
-    /// Local hardware filesystem interaction operations were blocked or interrupted.
+    /// Filesystem I/O interaction failure.
     #[error("I/O error while {operation} ({path}): {source}")]
     Io {
-        /// The precise local input method executed during the system crash.
         operation: &'static str,
-        /// File storage path location identifier target.
         path: PathBuf,
-        /// Raw file system standard library descriptor error payload.
         #[source]
         source: std::io::Error,
     },
 }
 
 impl AuthError {
-    /// Assembles an input parameter tracking exception.
+    /// Creates a new validation error.
     pub(crate) fn validation<E: fmt::Display>(message: E) -> Self {
         Self::ValidationError {
             message: message.to_string(),
         }
     }
 
-    /// Assembles a structural Cedar syntax parser check exception.
+    /// Creates a new Cedar validation error.
     pub(crate) fn cedar_validation<E: fmt::Display>(e: E) -> Self {
         Self::CedarValidation {
             message: e.to_string(),
         }
     }
 
-    /// Assembles an evaluation exception outputting from Cedar engine runtime steps.
+    /// Creates a new Cedar evaluation error.
     pub(crate) fn cedar_eval<E: fmt::Display>(e: E) -> Self {
         Self::CedarEvaluation {
             message: e.to_string(),
         }
     }
 
-    /// Maps a raw Tonic status payload error across to local representations.
+    /// Wraps a tonic status as a SpiceDB status error.
     pub(crate) fn spicedb_status(operation: &'static str, status: tonic::Status) -> Self {
         Self::SpiceDbStatus { operation, status }
     }
 
-    /// Assembles a functional invariant protocol tracking conflict payload.
+    /// Creates a new protocol/invariant error.
     pub(crate) fn spicedb_protocol(operation: &'static str, message: impl Into<String>) -> Self {
         Self::SpiceDbProtocol {
             operation,
@@ -199,7 +180,7 @@ impl AuthError {
         }
     }
 
-    /// Maps a system standard I/O storage issue across into a local engine representations block.
+    /// Wraps an I/O error with context.
     pub(crate) fn io(operation: &'static str, path: &Path, source: std::io::Error) -> Self {
         Self::Io {
             operation,
@@ -209,82 +190,65 @@ impl AuthError {
     }
 }
 
-/// A generic transformation trait that flattens struct scopes into Cedar attribute key-value pairs.
+/// Trait to transform data structures into Cedar context attributes.
 pub trait CedarContext<'a> {
-    /// serializes property attributes out into an initialized context builder wrapper container.
+    /// Serializes struct data into the provided context builder.
     ///
     /// # Errors
     ///
-    /// Returns an `AuthError` variant if runtime values violate internal conversion expectations.
+    /// Returns `AuthError` if runtime serialization fails.
     fn write_to(&self, out: &mut CedarContextBuilder<'a>) -> Result<(), AuthError>;
 }
 
 impl<'a> CedarContext<'a> for () {
-    /// Passthrough mock stub implementation facilitating seamless execution paths for empty contexts.
+    /// Implementation for empty contexts (no-op).
     fn write_to(&self, _out: &mut CedarContextBuilder<'a>) -> Result<(), AuthError> {
         Ok(())
     }
 }
 
-/// Strongly typed scalar value reference wrappers mapped into the Cedar evaluation runtime environment.
+/// Supported scalar types for Cedar evaluation.
 #[derive(Debug, Clone, Copy)]
 pub enum CedarValueRef<'a> {
-    /// A standard boolean conditional switch value statement.
+    /// Boolean conditional value.
     Bool(bool),
-    /// A signed 64-bit numerical integer value statement.
+    /// 64-bit integer value.
     I64(i64),
-    /// A clean ASCII or UTF-8 compliant character string reference.
+    /// String slice value.
     Str(&'a str),
 }
 
-/// An allocation-conscious accumulation builder used to serialize metadata profiles into Cedar contexts.
-///
-/// Internally, Cedar expects owned string identifiers and complex restricted evaluation expressions.
-/// This builder acts as an intermediate storage block allowing zero-copy slice collection
-/// up until final compilation boundaries are crossed.
+/// Accumulation builder for generating Cedar context attributes.
 pub struct CedarContextBuilder<'a> {
+    /// The collected key-value entries.
     pub(crate) entries: Vec<(&'a str, CedarValueRef<'a>)>,
 }
 
 impl<'a> CedarContextBuilder<'a> {
-    /// Assembles an empty storage builder allocating fixed initialization capacity thresholds up front.
+    /// Creates a new builder with the specified capacity.
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             entries: Vec::with_capacity(cap),
         }
     }
 
-    /// Appends a scalar boolean property onto the processing context track collection.
+    /// Appends a boolean attribute to the context.
     pub fn insert_bool(&mut self, key: &'a str, value: bool) {
         self.entries.push((key, CedarValueRef::Bool(value)));
     }
 
-    /// Appends a scalar signed 64-bit integer property onto the processing context track collection.
+    /// Appends an integer attribute to the context.
     pub fn insert_i64(&mut self, key: &'a str, value: i64) {
         self.entries.push((key, CedarValueRef::I64(value)));
     }
 
-    /// Appends a borrowed string slice value onto the processing context track collection.
+    /// Appends a string attribute to the context.
     pub fn insert_str(&mut self, key: &'a str, value: &'a str) {
         self.entries.push((key, CedarValueRef::Str(value)));
     }
 }
 
-/// Helper macro to map struct fields into Cedar keys with minimal boilerplate.
-///
-/// # Examples
-///
-/// ```ignore
-/// impl CedarContext for MyCtx {
-///   fn write_to(&self, out: &mut CedarContextBuilder<'_>) -> Result<(), AuthError> {
-///     loth::cedar_context_map!(out, self, {
-///       "device_compliant" => bool self.device_compliant,
-///       "ip_address" => str self.ip.as_str(),
-///     });
-///     Ok(())
-///   }
-/// }
-/// ```
+/// Maps struct fields into a `CedarContextBuilder` with specified types.
 #[macro_export]
 macro_rules! cedar_context_map {
     ($out:expr, $self_:expr, { $($key:literal => $ty:ident $expr:expr),* $(,)? }) => {{
