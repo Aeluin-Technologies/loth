@@ -6,17 +6,17 @@ pub mod schema;
 pub mod pb {
     pub mod google {
         pub mod protobuf {
-            include!(concat!(env!("OUT_DIR"), "/google.protobuf.rs"));
+            include!("../generated/google.protobuf.rs");
         }
         pub mod rpc {
-            include!(concat!(env!("OUT_DIR"), "/google.rpc.rs"));
+            include!("../generated/google.rpc.rs");
         }
     }
 
     pub mod authzed {
         pub mod api {
             pub mod v1 {
-                include!(concat!(env!("OUT_DIR"), "/authzed.api.v1.rs"));
+                include!("../generated/authzed.api.v1.rs");
             }
         }
     }

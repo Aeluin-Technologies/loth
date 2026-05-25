@@ -1,7 +1,8 @@
 //! Build script compiling vendored Authzed API v1 protos.
 
 fn main() {
-    let out_dir = std::env::var("OUT_DIR").unwrap();
+    /*let out_dir = "src/generated";
+    let _ = std::fs::create_dir(out_dir);
 
     let protos = &[
         "./proto/authzed/api/v1/permission_service.proto",
@@ -17,7 +18,8 @@ fn main() {
         .build_client(true)
         .out_dir(out_dir)
         .compile_with_config(prost_config, protos, &["./proto"])
-        .unwrap();
+        .unwrap();*/
 
-    println!("cargo:rerun-if-changed=./proto");
+    println!("cargo:rerun-if-changed=proto");
+    println!("cargo:rerun-if-changed=src/generated");
 }
