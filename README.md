@@ -2,7 +2,7 @@
 
 > *"I perceive the Dark Lord and know his mind, or all of his mind that
 > concerns the Elves. And he gropes ever to see me and my thought. But still
-> the door is closed!"*"
+> the door is closed!"*
 
 Loth is a high-performance authorization engine that combines ReBAC using
 SpiceDB and ABAC using Cedar. It provides a secure, contextual, and scalable
