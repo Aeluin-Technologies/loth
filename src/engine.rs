@@ -141,24 +141,37 @@ impl LothEngine {
         Ok(())
     }
 
-    /// Checks permission using ReBAC only.
+    /// Initializes a fluent authorization check request builder.
     ///
-    /// # Errors
-    ///
-    /// Returns `AuthError` on connection failures or if replication is broken.
+    /// This is the preferred method for building transactional or complex authorization queries.
     ///
     /// # Examples
     ///
     /// ```no_run
     /// # use loth::engine::LothEngine;
     /// # async fn run(engine: LothEngine) -> Result<(), loth::types::AuthError> {
-    /// let allowed = engine.check_permission("user:alice", "read", "document", "doc_01").await?;
-    /// if allowed {
-    ///     println!("Access granted");
-    /// }
+    /// let allowed = engine
+    ///     .prepare_check("user:alice", "read", "document", "doc_01")
+    ///     .check()
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
+    pub fn prepare_check<'a>(
+        &'a self,
+        user_id: &'a str,
+        action: &'a str,
+        resource_type: &'a str,
+        resource_id: &'a str,
+    ) -> CheckRequestBuilder<'a, ()> {
+        CheckRequestBuilder::new(self, user_id, action, resource_type, resource_id)
+    }
+
+    /// Checks permission using ReBAC only. Shortcut for `prepare_check().check()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError` on connection failures or if replication is broken.
     pub async fn check_permission(
         &self,
         user_id: &str,
@@ -166,80 +179,9 @@ impl LothEngine {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<bool, AuthError> {
-        self.check_permission_with_context::<'_, ()>(
-            user_id,
-            action,
-            resource_type,
-            resource_id,
-            None,
-        )
-        .await
-    }
-
-    /// Checks permission combining ReBAC and contextual Cedar ABAC.
-    ///
-    /// # Errors
-    ///
-    /// Returns `AuthError` on connection, evaluation, or replication failures.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use serde::Serialize;
-    /// # use loth::CedarContext;
-    /// # use loth::engine::LothEngine;
-    /// # async fn run(engine: LothEngine) -> Result<(), loth::types::AuthError> {
-    /// #[derive(Serialize)]
-    /// struct RequestContext { network_ip: String }
-    ///
-    /// impl<'a> CedarContext<'a> for RequestContext {
-    ///     fn write_to(&self, _: &mut loth::types::CedarContextBuilder<'a>) -> Result<(), loth::types::AuthError> {
-    ///         Ok(())
-    ///     }
-    /// }
-    ///
-    /// let ctx = RequestContext { network_ip: "10.0.0.1".to_string() };
-    /// let allowed = engine.check_permission_with_context(
-    ///     "user:bob",
-    ///     "write",
-    ///     "repository",
-    ///     "repo_42",
-    ///     Some(&ctx)
-    /// ).await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn check_permission_with_context<'a, C>(
-        &self,
-        user_id: &str,
-        action: &str,
-        resource_type: &str,
-        resource_id: &str,
-        context: Option<&'a C>,
-    ) -> Result<bool, AuthError>
-    where
-        C: CedarContext<'a>,
-    {
-        self.fail_closed_if_replication_broken()?;
-
-        let decision = self
-            .rebac
-            .check_permission(user_id, action, resource_type, resource_id)
-            .await?;
-
-        let is_structural_allowed = matches!(
-            decision,
-            RebacDecision::Allowed | RebacDecision::Conditional
-        );
-
-        self.abac.is_allowed(
-            is_structural_allowed,
-            user_id,
-            action,
-            resource_type,
-            resource_id,
-            context,
-        )
+        self.prepare_check(user_id, action, resource_type, resource_id)
+            .check()
+            .await
     }
 
     /// Registers a new relationship tuple.
@@ -339,9 +281,150 @@ impl LothEngine {
             .await
     }
 
-    /// Updates Cedar policies in memory.
+    /// Updates global Cedar policies in memory.
     pub fn update_cedar_policies(&self, new_policies_dsl: Option<&str>) -> Result<(), AuthError> {
         self.abac.update_policies(new_policies_dsl)
+    }
+}
+
+/// Fluent builder to construct and evaluate complex authorization requests.
+///
+/// Supports optional context injection and ephemeral request-scoped policy overrides.
+pub struct CheckRequestBuilder<'a, C = ()> {
+    engine: &'a LothEngine,
+    user_id: &'a str,
+    action: &'a str,
+    resource_type: &'a str,
+    resource_id: &'a str,
+    context: Option<&'a C>,
+    policy_override: Option<&'a str>,
+}
+
+impl<'a, C> CheckRequestBuilder<'a, C>
+where
+    C: CedarContext<'a>,
+{
+    /// Creates a new builder instance with required structural elements.
+    fn new(
+        engine: &'a LothEngine,
+        user_id: &'a str,
+        action: &'a str,
+        resource_type: &'a str,
+        resource_id: &'a str,
+    ) -> Self {
+        Self {
+            engine,
+            user_id,
+            action,
+            resource_type,
+            resource_id,
+            context: None,
+            policy_override: None,
+        }
+    }
+
+    /// Attaches dynamic Cedar context attributes to the request pipeline.
+    ///
+    /// Changes the generic type parameter of the builder to track the active context.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use serde::Serialize;
+    /// # use loth::{CedarContext, engine::LothEngine};
+    /// # #[derive(Serialize)] struct MyContext { ip: String }
+    /// # impl<'a> CedarContext<'a> for MyContext {
+    /// #     fn write_to(&self, _: &mut loth::types::CedarContextBuilder<'a>) -> Result<(), loth::types::AuthError> { Ok(()) }
+    /// # }
+    /// # async fn run(engine: LothEngine, ctx: MyContext) -> Result<(), loth::types::AuthError> {
+    /// let allowed = engine
+    ///     .prepare_check("user:bob", "write", "repo", "repo_42")
+    ///     .with_context(&ctx)
+    ///     .check()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_context<NewC>(self, context: &'a NewC) -> CheckRequestBuilder<'a, NewC> {
+        CheckRequestBuilder {
+            engine: self.engine,
+            user_id: self.user_id,
+            action: self.action,
+            resource_type: self.resource_type,
+            resource_id: self.resource_id,
+            context: Some(context),
+            policy_override: self.policy_override,
+        }
+    }
+
+    /// Configures an ephemeral, request-scoped Cedar policy definition.
+    ///
+    /// This bypasses the engine's internal shared ABAC state, providing isolation
+    /// for multi-tenant rules or local transaction evaluation.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use loth::engine::LothEngine;
+    /// # async fn run(engine: LothEngine) -> Result<(), loth::types::AuthError> {
+    /// let dsl = "permit(principal, action, resource) when { context.is_admin == true };";
+    /// let allowed = engine
+    ///     .prepare_check("user:bob", "delete", "server", "srv_99")
+    ///     .with_policy_override(dsl)
+    ///     .check()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_policy_override(mut self, policy_dsl: &'a str) -> Self {
+        self.policy_override = Some(policy_dsl);
+        self
+    }
+
+    /// Evaluates combined ReBAC and ABAC logic sequentially.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError` on connection, evaluation, or replication failures.
+    pub async fn check(self) -> Result<bool, AuthError> {
+        self.engine.fail_closed_if_replication_broken()?;
+
+        let decision = self
+            .engine
+            .rebac
+            .check_permission(
+                self.user_id,
+                self.action,
+                self.resource_type,
+                self.resource_id,
+            )
+            .await?;
+
+        let is_structural_allowed = matches!(
+            decision,
+            RebacDecision::Allowed | RebacDecision::Conditional
+        );
+
+        if let Some(dsl) = self.policy_override {
+            let temporary_abac = AbacEngine::new(Some(dsl))?;
+            temporary_abac.is_allowed(
+                is_structural_allowed,
+                self.user_id,
+                self.action,
+                self.resource_type,
+                self.resource_id,
+                self.context,
+            )
+        } else {
+            self.engine.abac.is_allowed(
+                is_structural_allowed,
+                self.user_id,
+                self.action,
+                self.resource_type,
+                self.resource_id,
+                self.context,
+            )
+        }
     }
 }
 
@@ -363,8 +446,7 @@ mod tests {
         }
     }
 
-    /// Allocates an ephemeral local TCP socket to satisfy client initialization handshakes
-    /// without a dependency on a running SpiceDB cluster instance.
+    /// Allocates an ephemeral local TCP socket to satisfy client initialization handshakes.
     async fn setup_fake_endpoint() -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -431,7 +513,9 @@ mod tests {
         };
 
         let res = engine
-            .check_permission_with_context("user:1", "view", "file", "a", Some(&ctx_valid))
+            .prepare_check("user:1", "view", "file", "a")
+            .with_context(&ctx_valid)
+            .check()
             .await;
 
         assert!(

@@ -112,13 +112,9 @@ async fn main() -> Result<(), AuthError> {
 
     // Case 1: Alice has correct structural ReBAC relationships and satisfies context ABAC rules
     let allowed_success = engine
-        .check_permission_with_context(
-            "alice",
-            "read",
-            "entity_state",
-            "file-742",
-            Some(&valid_ctx),
-        )
+        .prepare_check("alice", "read", "entity_state", "file-742")
+        .with_context(&valid_ctx)
+        .check()
         .await?;
 
     info!(
@@ -134,13 +130,9 @@ async fn main() -> Result<(), AuthError> {
 
     // Case 2: Alice has valid ReBAC structural rights, but is rejected by environmental edge filters
     let allowed_context_fail = engine
-        .check_permission_with_context(
-            "alice",
-            "read",
-            "entity_state",
-            "file-742",
-            Some(&invalid_ctx),
-        )
+        .prepare_check("alice", "read", "entity_state", "file-742")
+        .with_context(&invalid_ctx)
+        .check()
         .await?;
 
     info!(
@@ -151,7 +143,9 @@ async fn main() -> Result<(), AuthError> {
 
     // Case 3: Bob presents valid environment context tokens, but does not exist on the structural tree path
     let allowed_rebac_fail = engine
-        .check_permission_with_context("bob", "read", "entity_state", "file-742", Some(&valid_ctx))
+        .prepare_check("bob", "read", "entity_state", "file-742")
+        .with_context(&valid_ctx)
+        .check()
         .await?;
 
     info!(
