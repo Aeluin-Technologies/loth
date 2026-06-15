@@ -12,8 +12,6 @@ use crate::spicedb::rebac::{Rebac, RelationshipOp};
 use crate::types::AuthError;
 
 /// Immutable representation of a SpiceDB relationship.
-///
-/// Uses `Arc<str>` to reduce allocations and enable cheap sharing across thread boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelationshipTuple {
     /// Object namespace type.
@@ -29,7 +27,17 @@ pub struct RelationshipTuple {
 }
 
 impl RelationshipTuple {
-    /// Creates a new `RelationshipTuple` from types convertible to `Arc<str>`.
+    /// Creates a new [`RelationshipTuple`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use loth::replication::RelationshipTuple;
+    ///
+    /// let tuple = RelationshipTuple::new("document", "doc_01", "viewer", "user", "alice");
+    /// assert_eq!(tuple.resource_type.as_ref(), "document");
+    /// ```
     pub fn new(
         resource_type: impl Into<Arc<str>>,
         resource_id: impl Into<Arc<str>>,
@@ -92,7 +100,18 @@ impl ReplicationQueue {
     ///
     /// # Errors
     ///
-    /// Returns `AuthError` if the receiver has been dropped.
+    /// Returns `AuthError` if the channel receiver has been dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use loth::replication::{ReplicationQueue, RelationshipTuple, ReplicationEvent};
+    /// # async fn run(queue: ReplicationQueue) -> Result<(), loth::types::AuthError> {
+    /// let tuple = RelationshipTuple::new("folder", "f1", "owner", "user", "bob");
+    /// queue.enqueue(ReplicationEvent::Upsert(tuple)).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn enqueue(&self, ev: ReplicationEvent) -> Result<(), AuthError> {
         self.tx
             .send(ev)
@@ -101,11 +120,19 @@ impl ReplicationQueue {
     }
 
     /// Enqueues an Upsert operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError` if the channel receiver has been dropped.
     pub async fn upsert_tuple(&self, t: RelationshipTuple) -> Result<(), AuthError> {
         self.enqueue(ReplicationEvent::Upsert(t)).await
     }
 
     /// Enqueues a Delete operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError` if the channel receiver has been dropped.
     pub async fn delete_tuple(&self, t: RelationshipTuple) -> Result<(), AuthError> {
         self.enqueue(ReplicationEvent::Delete(t)).await
     }
@@ -182,6 +209,9 @@ pub fn replication_pipeline(
 impl ReplicationWorker {
     /// Starts the asynchronous worker loop.
     ///
+    /// Monitor the queue for inbound events, grouping them into batches up to `max_batch`
+    /// or flushing when `flush_interval` expires.
+    ///
     /// # Errors
     ///
     /// Returns `AuthError` if batch processing exhausts retry limits.
@@ -224,6 +254,9 @@ impl ReplicationWorker {
     }
 
     /// Dispatches batched updates via gRPC, implementing exponential backoff.
+    ///
+    /// Exceeding `max_retries` triggers a fail-closed status updates on the watch channel,
+    /// marking the entire replication layer broken.
     async fn flush(&mut self, buf: &mut Vec<ReplicationEvent>) -> Result<(), AuthError> {
         if buf.is_empty() {
             return Ok(());
@@ -260,6 +293,10 @@ impl ReplicationWorker {
 }
 
 /// Converts replication events into Protobuf-compatible updates.
+///
+/// # Errors
+///
+/// Returns `AuthError` if any invariant checking rules fail.
 fn build_updates(
     drained: impl IntoIterator<Item = ReplicationEvent>,
 ) -> Result<Vec<RelationshipUpdate>, AuthError> {
@@ -327,5 +364,51 @@ mod tests {
         let t = RelationshipTuple::new("tenant", "t1", "member", "user", "u1");
         assert_eq!(&*t.resource_type, "tenant");
         assert_eq!(&*t.subject_id, "u1");
+    }
+
+    #[test]
+    fn test_build_updates_conversion() {
+        let t = RelationshipTuple::new("doc", "123", "viewer", "user", "456");
+        let events = vec![
+            ReplicationEvent::Upsert(t.clone()),
+            ReplicationEvent::Delete(t),
+        ];
+
+        let updates = build_updates(events).unwrap();
+        assert_eq!(updates.len(), 2);
+
+        assert_eq!(
+            updates[0].operation,
+            crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Touch as i32
+        );
+        assert_eq!(
+            updates[1].operation,
+            crate::spicedb::pb::authzed::api::v1::relationship_update::Operation::Delete as i32
+        );
+
+        let resource = updates[0]
+            .relationship
+            .as_ref()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap();
+        assert_eq!(resource.object_type, "doc");
+        assert_eq!(resource.object_id, "123");
+    }
+
+    #[tokio::test]
+    async fn test_queue_backpressure_and_close() {
+        let (tx, rx) = mpsc::channel(1);
+        let queue = ReplicationQueue { tx };
+
+        let t = RelationshipTuple::new("doc", "1", "owner", "user", "1");
+        queue.upsert_tuple(t.clone()).await.unwrap();
+
+        // Drop receiver to simulate a broken channel pipeline.
+        drop(rx);
+
+        let err = queue.delete_tuple(t).await.unwrap_err();
+        assert!(err.to_string().contains("replication queue closed"));
     }
 }

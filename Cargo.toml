@@ -25,3 +25,4 @@ cedar-policy = "4.11"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "0.3"
+serde = "1"

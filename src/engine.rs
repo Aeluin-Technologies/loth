@@ -48,6 +48,24 @@ impl LothEngine {
     /// # Errors
     ///
     /// Returns `AuthError` if connection fails or schema/policy validation errors occur.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use loth::LothConfig;
+    /// # use loth::engine::{LothEngine, EngineSettings};
+    /// # async fn run() -> Result<(), loth::types::AuthError> {
+    /// let cfg = LothConfig {
+    ///     spicedb_endpoint: "http://127.0.0.1:50051".into(),
+    ///     spicedb_token: "secret".into(),
+    ///     zed_schema: None,
+    ///     cedar_policies: None,
+    /// };
+    /// let settings = EngineSettings::default();
+    /// let (engine, client) = LothEngine::from_config(cfg, settings).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn from_config(
         cfg: LothConfig<'_>,
         settings: EngineSettings,
@@ -128,6 +146,19 @@ impl LothEngine {
     /// # Errors
     ///
     /// Returns `AuthError` on connection failures or if replication is broken.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use loth::engine::LothEngine;
+    /// # async fn run(engine: LothEngine) -> Result<(), loth::types::AuthError> {
+    /// let allowed = engine.check_permission("user:alice", "read", "document", "doc_01").await?;
+    /// if allowed {
+    ///     println!("Access granted");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn check_permission(
         &self,
         user_id: &str,
@@ -150,6 +181,34 @@ impl LothEngine {
     /// # Errors
     ///
     /// Returns `AuthError` on connection, evaluation, or replication failures.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use serde::Serialize;
+    /// # use loth::CedarContext;
+    /// # use loth::engine::LothEngine;
+    /// # async fn run(engine: LothEngine) -> Result<(), loth::types::AuthError> {
+    /// #[derive(Serialize)]
+    /// struct RequestContext { network_ip: String }
+    ///
+    /// impl<'a> CedarContext<'a> for RequestContext {
+    ///     fn write_to(&self, _: &mut loth::types::CedarContextBuilder<'a>) -> Result<(), loth::types::AuthError> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let ctx = RequestContext { network_ip: "10.0.0.1".to_string() };
+    /// let allowed = engine.check_permission_with_context(
+    ///     "user:bob",
+    ///     "write",
+    ///     "repository",
+    ///     "repo_42",
+    ///     Some(&ctx)
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn check_permission_with_context<'a, C>(
         &self,
         user_id: &str,
@@ -184,6 +243,20 @@ impl LothEngine {
     }
 
     /// Registers a new relationship tuple.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use loth::engine::LothEngine;
+    /// # async fn run(engine: LothEngine) -> Result<(), loth::types::AuthError> {
+    /// engine.register_relation(
+    ///     "workspace", "ws_01",
+    ///     "member",
+    ///     "user", "user:charlie"
+    /// ).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn register_relation(
         &self,
         resource_type: &str,
@@ -269,5 +342,101 @@ impl LothEngine {
     /// Updates Cedar policies in memory.
     pub fn update_cedar_policies(&self, new_policies_dsl: Option<&str>) -> Result<(), AuthError> {
         self.abac.update_policies(new_policies_dsl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{AuthError, CedarContext, CedarContextBuilder};
+    use serde::Serialize;
+    use tokio::sync::watch;
+
+    #[derive(Serialize)]
+    struct MockContext {
+        secure_network: bool,
+    }
+
+    impl<'a> CedarContext<'a> for MockContext {
+        fn write_to(&self, _out: &mut CedarContextBuilder<'a>) -> Result<(), AuthError> {
+            Ok(())
+        }
+    }
+
+    /// Allocates an ephemeral local TCP socket to satisfy client initialization handshakes
+    /// without a dependency on a running SpiceDB cluster instance.
+    async fn setup_fake_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind ephemeral test socket");
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn test_fail_closed_when_replication_faulty() {
+        let (tx, rx) = watch::channel(None);
+        let fake_url = setup_fake_endpoint().await;
+
+        let client = SpiceDbClient::connect(&fake_url, "test-token")
+            .await
+            .expect("Failed to initialize SpiceDbClient endpoint");
+
+        let engine = LothEngine {
+            rebac: Rebac::new(client.clone()),
+            abac: AbacEngine::new(None).unwrap(),
+            zed_schema: "definition user {}".to_string(),
+            fatal_replication: Some(rx),
+        };
+
+        let sync_err = AuthError::spicedb_protocol(
+            "replication_tracker",
+            "Replica lag exceeded threshold limit",
+        );
+        tx.send(Some(sync_err)).unwrap();
+
+        let res = engine.check_permission("user:1", "read", "doc", "1").await;
+        assert!(
+            res.is_err(),
+            "Engine must fail closed when replication tracking enters a fatal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_permission_with_context_routing() {
+        let fake_url = setup_fake_endpoint().await;
+        let client = SpiceDbClient::connect(&fake_url, "test-token")
+            .await
+            .expect("Failed to initialize SpiceDbClient endpoint");
+
+        let dsl_policy =
+            "permit(principal, action, resource) when { context.secure_network == true };";
+
+        let engine = LothEngine {
+            rebac: Rebac::new(client.clone()),
+            abac: AbacEngine::new(Some(dsl_policy)).unwrap(),
+            zed_schema: String::new(),
+            fatal_replication: None,
+        };
+
+        let ctx_valid = MockContext {
+            secure_network: true,
+        };
+
+        let res = engine
+            .check_permission_with_context("user:1", "view", "file", "a", Some(&ctx_valid))
+            .await;
+
+        assert!(
+            res.is_err(),
+            "Expected transport layer error from raw TCP test endpoint"
+        );
     }
 }
