@@ -15,6 +15,8 @@ pub mod pb {
 
     pub mod authzed {
         pub mod api {
+            // Generated Prost types mirror the wire format and cannot box large variants.
+            #[allow(clippy::large_enum_variant)]
             pub mod v1 {
                 include!("../generated/authzed.api.v1.rs");
             }
