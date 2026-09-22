@@ -47,7 +47,9 @@ impl SchemaManager {
         mode: SchemaMode,
     ) -> Result<(), AuthError> {
         let req = DiffSchemaRequest {
-            consistency: None,
+            consistency: Some(Consistency {
+                requirement: Some(Requirement::FullyConsistent(true)),
+            }),
             comparison_schema: desired_schema.to_owned(),
         };
         let mut client = self.client.schema_client().await;
