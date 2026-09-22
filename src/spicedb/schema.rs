@@ -6,9 +6,11 @@ use tonic::Code;
 use tracing::{debug, instrument};
 
 use crate::spicedb::client::SpiceDbClient;
+use crate::spicedb::pb::authzed::api::v1::consistency::Requirement;
 use crate::spicedb::pb::authzed::api::v1::reflection_schema_diff::Diff;
 use crate::spicedb::pb::authzed::api::v1::{
-    DiffSchemaRequest, ReadSchemaRequest, ReflectionSchemaDiff, WriteSchemaRequest,
+    Consistency, DiffSchemaRequest, ReadSchemaRequest, ReflectSchemaRequest, ReflectionCaveat,
+    ReflectionSchemaDiff, WriteSchemaRequest,
 };
 use crate::types::AuthError;
 
@@ -50,7 +52,27 @@ impl SchemaManager {
         };
         let mut client = self.client.schema_client().await;
         let has_functional_diff = match client.diff_schema(req).await {
-            Ok(response) => has_functional_schema_diff(&response.into_inner().diffs),
+            Ok(response) => {
+                let response = response.into_inner();
+                let remote_caveats = if has_caveat_expression_diff(&response.diffs) {
+                    let consistency = response.read_at.map(|token| Consistency {
+                        requirement: Some(Requirement::AtExactSnapshot(token)),
+                    });
+                    client
+                        .reflect_schema(ReflectSchemaRequest {
+                            consistency,
+                            optional_filters: Vec::new(),
+                        })
+                        .await
+                        .map_err(|status| AuthError::spicedb_status("reflect_schema", status))?
+                        .into_inner()
+                        .caveats
+                } else {
+                    Vec::new()
+                };
+
+                has_functional_schema_diff(&response.diffs, &remote_caveats)
+            }
             Err(status) if status.code() == Code::NotFound => true,
             Err(status) => return Err(AuthError::spicedb_status("diff_schema", status)),
         };
@@ -110,25 +132,36 @@ impl SchemaManager {
 }
 
 /// Returns whether a structural schema diff contains a functional change.
-fn has_functional_schema_diff(diffs: &[ReflectionSchemaDiff]) -> bool {
-    diffs.iter().any(|change| {
-        !matches!(
-            &change.diff,
-            Some(
-                Diff::DefinitionDocCommentChanged(_)
-                    | Diff::RelationDocCommentChanged(_)
-                    | Diff::PermissionDocCommentChanged(_)
-                    | Diff::CaveatDocCommentChanged(_)
-            )
-        )
+fn has_functional_schema_diff(
+    diffs: &[ReflectionSchemaDiff],
+    remote_caveats: &[ReflectionCaveat],
+) -> bool {
+    diffs.iter().any(|change| match &change.diff {
+        Some(
+            Diff::DefinitionDocCommentChanged(_)
+            | Diff::RelationDocCommentChanged(_)
+            | Diff::PermissionDocCommentChanged(_)
+            | Diff::CaveatDocCommentChanged(_),
+        ) => false,
+        Some(Diff::CaveatExprChanged(candidate)) => remote_caveats
+            .iter()
+            .find(|current| current.name == candidate.name)
+            .is_none_or(|current| current.expression != candidate.expression),
+        Some(_) | None => true,
     })
+}
+
+fn has_caveat_expression_diff(diffs: &[ReflectionSchemaDiff]) -> bool {
+    diffs
+        .iter()
+        .any(|change| matches!(change.diff, Some(Diff::CaveatExprChanged(_))))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spicedb::pb::authzed::api::v1::{
-        ReflectionCaveat, ReflectionDefinition, ReflectionPermission, ReflectionRelation,
+        ReflectionDefinition, ReflectionPermission, ReflectionRelation,
     };
 
     #[test]
@@ -167,7 +200,7 @@ mod tests {
             },
         ];
 
-        assert!(!has_functional_schema_diff(&diffs));
+        assert!(!has_functional_schema_diff(&diffs, &[]));
     }
 
     #[test]
@@ -180,6 +213,30 @@ mod tests {
             })),
         }];
 
-        assert!(has_functional_schema_diff(&diffs));
+        assert!(has_functional_schema_diff(&diffs, &[]));
+    }
+
+    #[test]
+    fn semantic_diff_compares_reflected_caveat_expressions() {
+        let changed_caveat = ReflectionCaveat {
+            name: "enabled".to_owned(),
+            comment: String::new(),
+            parameters: Vec::new(),
+            expression: "flag".to_owned(),
+        };
+        let diffs = [ReflectionSchemaDiff {
+            diff: Some(Diff::CaveatExprChanged(changed_caveat.clone())),
+        }];
+
+        assert!(!has_functional_schema_diff(
+            &diffs,
+            std::slice::from_ref(&changed_caveat),
+        ));
+
+        let remote_caveat = ReflectionCaveat {
+            expression: "!flag".to_owned(),
+            ..changed_caveat
+        };
+        assert!(has_functional_schema_diff(&diffs, &[remote_caveat]));
     }
 }

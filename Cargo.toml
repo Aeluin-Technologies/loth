@@ -23,6 +23,7 @@ cedar-policy = "4.11"
 #prost-build = "0.14"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tracing-subscriber = "0.3"
 serde = "1"
+testcontainers = "0.28"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tracing-subscriber = "0.3"
