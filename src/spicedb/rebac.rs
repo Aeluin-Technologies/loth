@@ -71,23 +71,41 @@ impl Rebac {
         resource_type: &str,
         resource_id: &str,
     ) -> Result<RebacDecision, AuthError> {
-        let req = CheckPermissionRequest {
-            resource: Some(ObjectReference {
-                object_type: resource_type.to_owned(),
-                object_id: resource_id.to_owned(),
-            }),
-            permission: permission.to_owned(),
-            subject: Some(SubjectReference {
-                object: Some(ObjectReference {
-                    object_type: "user".to_owned(),
-                    object_id: user_id.to_owned(),
-                }),
-                optional_relation: String::new(),
-            }),
-            consistency: None,
-            context: None,
-            with_tracing: false,
-        };
+        self.check_permission_at_consistency(user_id, permission, resource_type, resource_id, false)
+            .await
+    }
+
+    /// Checks at the latest committed SpiceDB revision for security-sensitive reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns `AuthError` if the gRPC interface fails or the response is unknown.
+    pub async fn check_permission_fully_consistent(
+        &self,
+        user_id: &str,
+        permission: &str,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Result<RebacDecision, AuthError> {
+        self.check_permission_at_consistency(user_id, permission, resource_type, resource_id, true)
+            .await
+    }
+
+    async fn check_permission_at_consistency(
+        &self,
+        user_id: &str,
+        permission: &str,
+        resource_type: &str,
+        resource_id: &str,
+        fully_consistent: bool,
+    ) -> Result<RebacDecision, AuthError> {
+        let req = check_permission_request(
+            user_id,
+            permission,
+            resource_type,
+            resource_id,
+            fully_consistent,
+        );
 
         let mut client = self.client.permissions_client().await;
         let resp = client
@@ -249,6 +267,54 @@ impl Rebac {
         }
 
         Ok(out)
+    }
+}
+
+fn check_permission_request(
+    user_id: &str,
+    permission: &str,
+    resource_type: &str,
+    resource_id: &str,
+    fully_consistent: bool,
+) -> CheckPermissionRequest {
+    CheckPermissionRequest {
+        resource: Some(ObjectReference {
+            object_type: resource_type.to_owned(),
+            object_id: resource_id.to_owned(),
+        }),
+        permission: permission.to_owned(),
+        subject: Some(SubjectReference {
+            object: Some(ObjectReference {
+                object_type: "user".to_owned(),
+                object_id: user_id.to_owned(),
+            }),
+            optional_relation: String::new(),
+        }),
+        consistency: fully_consistent.then_some(Consistency {
+            requirement: Some(consistency::Requirement::FullyConsistent(true)),
+        }),
+        context: None,
+        with_tracing: false,
+    }
+}
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+
+    #[test]
+    fn fully_consistent_check_requests_current_revision() {
+        let request = check_permission_request("alice", "view", "document", "doc-1", true);
+        assert!(matches!(
+            request.consistency.and_then(|value| value.requirement),
+            Some(consistency::Requirement::FullyConsistent(true))
+        ));
+    }
+
+    #[test]
+    fn default_check_keeps_existing_latency_policy() {
+        let request = check_permission_request("alice", "view", "document", "doc-1", false);
+        assert!(request.consistency.is_none());
     }
 }
 

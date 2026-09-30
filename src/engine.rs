@@ -298,6 +298,7 @@ pub struct CheckRequestBuilder<'a, C = ()> {
     resource_id: &'a str,
     context: Option<&'a C>,
     policy_override: Option<&'a str>,
+    fully_consistent: bool,
 }
 
 impl<'a, C> CheckRequestBuilder<'a, C>
@@ -320,6 +321,7 @@ where
             resource_id,
             context: None,
             policy_override: None,
+            fully_consistent: false,
         }
     }
 
@@ -354,7 +356,14 @@ where
             resource_id: self.resource_id,
             context: Some(context),
             policy_override: self.policy_override,
+            fully_consistent: self.fully_consistent,
         }
+    }
+
+    /// Requires the latest SpiceDB revision for a security-sensitive check.
+    pub fn fully_consistent(mut self) -> Self {
+        self.fully_consistent = true;
+        self
     }
 
     /// Configures an ephemeral, request-scoped Cedar policy definition.
@@ -389,16 +398,27 @@ where
     pub async fn check(self) -> Result<bool, AuthError> {
         self.engine.fail_closed_if_replication_broken()?;
 
-        let decision = self
-            .engine
-            .rebac
-            .check_permission(
-                self.user_id,
-                self.action,
-                self.resource_type,
-                self.resource_id,
-            )
-            .await?;
+        let decision = if self.fully_consistent {
+            self.engine
+                .rebac
+                .check_permission_fully_consistent(
+                    self.user_id,
+                    self.action,
+                    self.resource_type,
+                    self.resource_id,
+                )
+                .await?
+        } else {
+            self.engine
+                .rebac
+                .check_permission(
+                    self.user_id,
+                    self.action,
+                    self.resource_type,
+                    self.resource_id,
+                )
+                .await?
+        };
 
         let is_structural_allowed = matches!(
             decision,
@@ -522,5 +542,28 @@ mod tests {
             res.is_err(),
             "Expected transport layer error from raw TCP test endpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn fully_consistent_builder_preserves_context() {
+        let endpoint = setup_fake_endpoint().await;
+        let client = SpiceDbClient::connect(&endpoint, "test-token")
+            .await
+            .expect("Failed to initialize SpiceDbClient endpoint");
+        let engine = LothEngine {
+            rebac: Rebac::new(client),
+            abac: AbacEngine::new(None).expect("Failed to initialize ABAC"),
+            zed_schema: String::new(),
+            fatal_replication: None,
+        };
+        let context = MockContext {
+            secure_network: true,
+        };
+        let request = engine
+            .prepare_check("alice", "view", "document", "doc-1")
+            .fully_consistent()
+            .with_context(&context);
+        assert!(request.fully_consistent);
+        assert!(request.context.is_some());
     }
 }
